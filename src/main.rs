@@ -1,50 +1,58 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, Result};
 use tokio::net::{TcpListener, TcpStream};
 
+async fn handle_client(client: &mut TcpStream, modbus: &mut TcpStream) -> Result<()> {
+    let (client_reader, mut client_writer) = client.split();
+    let (modbus_reader, mut modbus_writer) = modbus.split();
+    let mut client_reader = BufReader::new(client_reader);
+    let mut modbus_reader = BufReader::new(modbus_reader);
+    let mut header = vec![0; 4];
+    let mut buffer = [0; 8192];
+    loop {
+        // Read header
+        client_reader.read_exact(&mut header).await?;
+        // Read size
+        let size = client_reader.read_u16().await?;
+        let u_size = size as usize;
+
+        // Read payload
+        client_reader.read_exact(&mut buffer[0..u_size]).await?;
+
+        // Write all
+        modbus_writer.write_all(&header).await?;
+        modbus_writer.write_u16(size).await?;
+        modbus_writer.write_all(&buffer[0..u_size]).await?;
+
+        // Read header
+        modbus_reader.read_exact(&mut header).await?;
+        // Read size
+
+        let size = modbus_reader.read_u16().await?;
+        let u_size = size as usize;
+
+        // Read payload
+        //let mut buffer = vec![0; size as usize];
+        modbus_reader.read_exact(&mut buffer[0..u_size]).await?;
+
+        // Write all
+        client_writer.write_all(&header).await?;
+        client_writer.write_u16(size).await?;
+        client_writer.write_all(&buffer[0..u_size]).await?;
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
     loop {
-        let (mut client, _) = listener.accept().await?;
+        let (mut client, _addr) = listener.accept().await?;
         let mut modbus = TcpStream::connect("127.0.0.1:5030").await?;
+        client.set_nodelay(true)?;
+        modbus.set_nodelay(true)?;
 
         tokio::spawn(async move {
-            let mut buf = [0; 1024];
-
-            // In a loop, read data from the client and write the data back.
-            loop {
-                let n = match client.read(&mut buf).await {
-                    // socket closed
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("failed to read from client; err = {:?}", e);
-                        return;
-                    }
-                };
-
-                if let Err(e) = modbus.write_all(&buf[0..n]).await {
-                    eprintln!("failed to write to modbus; err = {:?}", e);
-                    return;
-                }
-
-                let n = match modbus.read(&mut buf).await {
-                    // socket closed
-                    Ok(n) if n == 0 => return,
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("failed to read from modbus; err = {:?}", e);
-                        return;
-                    }
-                };
-
-                // Write the data back
-                if let Err(e) = client.write_all(&buf[0..n]).await {
-                    eprintln!("failed to write to client; err = {:?}", e);
-                    return;
-                }
-            }
+            handle_client(&mut client, &mut modbus).await;
         });
     }
 }
