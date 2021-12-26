@@ -34,22 +34,18 @@ async fn read_packet_into(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usiz
     Ok(total_size)
 }
 
-async fn write_packet(stream: &mut TcpStream, buf: &[u8], size: usize) -> IOResult<()> {
-    stream.write_all(&buf[0..size]).await
-}
-
 async fn handle_client(mut client: &mut TcpStream, mut modbus: &mut TcpStream) -> Result<()> {
     let mut buf = [0; 8192];
     loop {
         let size = read_packet_into(&mut client, &mut buf).await?;
 
         // Write all
-        write_packet(&mut modbus, &buf, size).await?;
+        modbus.write_all(&buf[0..size]).await?;
 
         let size = read_packet_into(&mut modbus, &mut buf).await?;
 
         // Write all
-        write_packet(&mut client, &buf, size).await?;
+        client.write_all(&buf[0..size]).await?;
     }
 }
 
