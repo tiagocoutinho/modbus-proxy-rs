@@ -57,24 +57,15 @@ impl Packet for [u8] {
     }
 }
 
-async fn read_packet_into(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize> {
-    // Read header
-    stream.read_exact(&mut buf[0..6]).await?;
-    // calculate payload size
-    let total_size = buf.total_size()?;
-    stream.read_exact(&mut buf[6..total_size]).await?;
-    Ok(total_size)
-}
-
-async fn handle_client(client: &mut Connection, mut modbus: &mut TcpStream) -> Result<()> {
+async fn handle_client(client: &mut Connection, modbus: &mut Connection) -> Result<()> {
     let mut buf = [0; 8192];
     loop {
         let size = client.read_frame_into(&mut buf).await?;
 
         // Write all
-        modbus.write_all(&buf[0..size]).await?;
+        modbus.write_frame(&buf[0..size]).await?;
 
-        let size = read_packet_into(&mut modbus, &mut buf).await?;
+        let size = modbus.read_frame_into(&mut buf).await?;
 
         // Write all
         client.write_frame(&buf[0..size]).await?;
@@ -93,11 +84,12 @@ async fn server(modbus: Modbus) -> IOResult<()> {
         let addr = modbus.modbus_address.clone();
         let (client, client_addr) = listener.accept().await?;
         println!("Connecting to modbus for {}...", client_addr);
-        let mut modbus = TcpStream::connect(addr).await?;
+        let modbus = TcpStream::connect(addr).await?;
         println!("Connected to modbus for {}!", client_addr);
-        // client.set_nodelay(true)?;
-        // modbus.set_nodelay(true)?;
+        client.set_nodelay(true)?;
+        modbus.set_nodelay(true)?;
         let mut client = Connection::new(client);
+        let mut modbus = Connection::new(modbus);
         tokio::spawn(async move {
             match handle_client(&mut client, &mut modbus).await {
                 Err(err) => eprintln!("Error {}: {:?}", client_addr, err),
