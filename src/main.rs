@@ -2,9 +2,17 @@ use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, Result};
 use tokio::net::{TcpListener, TcpStream};
 
-fn read_u16(data: &[u8]) -> std::result::Result<u16, Box<dyn Error>> {
-    Ok(u16::from_be_bytes(data[0..2].try_into()?))
+trait PayloadSize {
+    fn payload_size(&self) -> std::result::Result<u16, Box<dyn Error>>;
 }
+
+impl PayloadSize for [u8] {
+    fn payload_size(&self) -> std::result::Result<u16, Box<dyn Error>> {
+        Ok(u16::from_be_bytes(self[4..6].try_into()?))
+    }
+}
+
+// async fn read_packet(stream: &TcpStream) -> Result<Packet> {}
 
 async fn handle_client(
     client: &mut TcpStream,
@@ -14,12 +22,12 @@ async fn handle_client(
     let (modbus_reader, mut modbus_writer) = modbus.split();
     let mut client_reader = BufReader::new(client_reader);
     let mut modbus_reader = BufReader::new(modbus_reader);
-    let mut buffer = [0; 8192];
+    let mut buffer = [0; 1024];
     loop {
         // Read header
         client_reader.read_exact(&mut buffer[0..6]).await?;
         // calculate payload size
-        let size = read_u16(&buffer[4..6])? as usize;
+        let size = buffer.payload_size()? as usize;
         let total_size: usize = 6 + size;
 
         // Read payload
@@ -31,7 +39,7 @@ async fn handle_client(
         // Read header
         modbus_reader.read_exact(&mut buffer[0..6]).await?;
         // calculate payload size
-        let size = read_u16(&buffer[4..6])? as usize;
+        let size = buffer.payload_size()? as usize;
         let total_size: usize = 6 + size;
 
         // Read payload
