@@ -72,24 +72,22 @@ async fn handle_client(client: &mut Connection, modbus: &mut Connection) -> Resu
     }
 }
 
-struct Modbus {
+struct Config {
     bind_address: String,
     modbus_address: String,
 }
 
-async fn server(modbus: Modbus) -> IOResult<()> {
-    let listener = TcpListener::bind(modbus.bind_address).await?;
+async fn server(config: Config) -> IOResult<()> {
+    let listener = TcpListener::bind(config.bind_address).await?;
 
     loop {
-        let addr = modbus.modbus_address.clone();
         let (client, client_addr) = listener.accept().await?;
-        println!("Connecting to modbus for {}...", client_addr);
-        let modbus = TcpStream::connect(addr).await?;
-        println!("Connected to modbus for {}!", client_addr);
+        let addr = config.modbus_address.clone();
+        let modbus_stream = TcpStream::connect(addr).await?;
+        modbus_stream.set_nodelay(true)?;
         client.set_nodelay(true)?;
-        modbus.set_nodelay(true)?;
+        let mut modbus = Connection::new(modbus_stream);
         let mut client = Connection::new(client);
-        let mut modbus = Connection::new(modbus);
         tokio::spawn(async move {
             match handle_client(&mut client, &mut modbus).await {
                 Err(err) => eprintln!("Error {}: {:?}", client_addr, err),
@@ -101,9 +99,9 @@ async fn server(modbus: Modbus) -> IOResult<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> IOResult<()> {
-    let modbus = Modbus {
+    let config = Config {
         bind_address: "127.0.0.1:8080".to_string(),
         modbus_address: "127.0.0.1:5030".to_string(),
     };
-    server(modbus).await
+    server(config).await
 }
