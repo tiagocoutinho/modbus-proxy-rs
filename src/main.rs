@@ -1,8 +1,41 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Result as IOResult};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Result as IOResult};
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpListener, TcpStream,
+};
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
+
+struct Connection {
+    writer: BufWriter<OwnedWriteHalf>,
+    reader: BufReader<OwnedReadHalf>,
+}
+
+impl Connection {
+    fn new(stream: TcpStream) -> Connection {
+        let (reader, writer) = stream.into_split();
+        Connection {
+            writer: BufWriter::new(writer),
+            reader: BufReader::new(reader),
+        }
+    }
+
+    async fn read_frame_into(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // Read header
+        self.reader.read_exact(&mut buf[0..6]).await?;
+        // calculate payload size
+        let total_size = buf.total_size()?;
+        self.reader.read_exact(&mut buf[6..total_size]).await?;
+        Ok(total_size)
+    }
+
+    async fn write_frame(&mut self, buf: &[u8]) -> IOResult<()> {
+        self.writer.write_all(buf).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+}
 
 trait Packet {
     fn payload_size(&self) -> Result<usize>;
@@ -29,15 +62,14 @@ async fn read_packet_into(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usiz
     stream.read_exact(&mut buf[0..6]).await?;
     // calculate payload size
     let total_size = buf.total_size()?;
-
     stream.read_exact(&mut buf[6..total_size]).await?;
     Ok(total_size)
 }
 
-async fn handle_client(mut client: &mut TcpStream, mut modbus: &mut TcpStream) -> Result<()> {
+async fn handle_client(client: &mut Connection, mut modbus: &mut TcpStream) -> Result<()> {
     let mut buf = [0; 8192];
     loop {
-        let size = read_packet_into(&mut client, &mut buf).await?;
+        let size = client.read_frame_into(&mut buf).await?;
 
         // Write all
         modbus.write_all(&buf[0..size]).await?;
@@ -45,7 +77,7 @@ async fn handle_client(mut client: &mut TcpStream, mut modbus: &mut TcpStream) -
         let size = read_packet_into(&mut modbus, &mut buf).await?;
 
         // Write all
-        client.write_all(&buf[0..size]).await?;
+        client.write_frame(&buf[0..size]).await?;
     }
 }
 
@@ -59,14 +91,16 @@ async fn server(modbus: Modbus) -> IOResult<()> {
 
     loop {
         let addr = modbus.modbus_address.clone();
-        let (mut client, _addr) = listener.accept().await?;
+        let (client, client_addr) = listener.accept().await?;
+        println!("Connecting to modbus for {}...", client_addr);
         let mut modbus = TcpStream::connect(addr).await?;
+        println!("Connected to modbus for {}!", client_addr);
         // client.set_nodelay(true)?;
         // modbus.set_nodelay(true)?;
-
+        let mut client = Connection::new(client);
         tokio::spawn(async move {
             match handle_client(&mut client, &mut modbus).await {
-                Err(err) => eprintln!("Error: {:?}", err),
+                Err(err) => eprintln!("Error {}: {:?}", client_addr, err),
                 _ => {}
             }
         });
