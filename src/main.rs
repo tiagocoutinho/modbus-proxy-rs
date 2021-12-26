@@ -2,48 +2,58 @@ use std::error::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Result};
 use tokio::net::{TcpListener, TcpStream};
 
-trait PacketSize {
-    fn payload_size(&self) -> std::result::Result<u16, Box<dyn Error>>;
+trait Packet {
+    fn payload_size(&self) -> std::result::Result<usize, Box<dyn Error>>;
 
-    fn total_size(&self) -> std::result::Result<u16, Box<dyn Error>> {
+    fn total_size(&self) -> std::result::Result<usize, Box<dyn Error>> {
         Ok(6 + self.payload_size()?)
     }
+
+    fn packet(&self) -> std::result::Result<&[u8], Box<dyn Error>>;
 }
 
-impl PacketSize for [u8] {
-    fn payload_size(&self) -> std::result::Result<u16, Box<dyn Error>> {
-        Ok(u16::from_be_bytes(self[4..6].try_into()?))
+impl Packet for [u8] {
+    fn payload_size(&self) -> std::result::Result<usize, Box<dyn Error>> {
+        Ok(u16::from_be_bytes(self[4..6].try_into()?) as usize)
+    }
+    fn packet(&self) -> std::result::Result<&[u8], Box<dyn Error>> {
+        let size = self.total_size()?;
+        Ok(&self[0..size])
     }
 }
 
-// async fn read_packet(stream: &TcpStream) -> Result<Packet> {}
+async fn read_packet_into(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+) -> std::result::Result<usize, Box<dyn Error>> {
+    // Read header
+    stream.read_exact(&mut buf[0..6]).await?;
+    // calculate payload size
+    let total_size = buf.total_size()?;
+
+    stream.read_exact(&mut buf[6..total_size]).await?;
+    Ok(total_size)
+}
+
+async fn write_packet(stream: &mut TcpStream, buf: &[u8], size: usize) -> Result<()> {
+    stream.write_all(&buf[0..size]).await
+}
 
 async fn handle_client(
-    client: &mut TcpStream,
-    modbus: &mut TcpStream,
+    mut client: &mut TcpStream,
+    mut modbus: &mut TcpStream,
 ) -> std::result::Result<(), Box<dyn Error>> {
-    let mut buffer = [0; 8192];
+    let mut buf = [0; 8192];
     loop {
-        // Read header
-        client.read_exact(&mut buffer[0..6]).await?;
-        // calculate payload size
-        let total_size = buffer.total_size()? as usize;
-
-        client.read_exact(&mut buffer[6..total_size]).await?;
+        let size = read_packet_into(&mut client, &mut buf).await?;
 
         // Write all
-        modbus.write_all(&buffer[0..total_size]).await?;
+        write_packet(&mut modbus, &buf, size).await?;
 
-        // Read header
-        modbus.read_exact(&mut buffer[0..6]).await?;
-
-        let total_size = buffer.total_size()? as usize;
-
-        // Read payload
-        modbus.read_exact(&mut buffer[6..total_size]).await?;
+        let size = read_packet_into(&mut modbus, &mut buf).await?;
 
         // Write all
-        client.write_all(&buffer[0..total_size]).await?;
+        write_packet(&mut client, &buf, size).await?;
     }
 }
 
