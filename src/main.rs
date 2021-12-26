@@ -82,10 +82,10 @@ async fn server(modbus: Modbus) -> Result<()> {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     let modbus = Modbus {
         bind_address: "127.0.0.1:8080".to_string(),
         modbus_address: "127.0.0.1:5030".to_string(),
     };
-    Ok(server(modbus).await?)
+    server(modbus).await
 }
