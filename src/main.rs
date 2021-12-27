@@ -1,42 +1,60 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Result as IOResult};
-use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-    TcpListener, TcpStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Result as IOResult};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
 type Frame = Vec<u8>;
-type Sender = mpsc::Sender<(Frame, oneshot::Sender<Frame>)>;
-type Receiver = mpsc::Receiver<(Frame, oneshot::Sender<Frame>)>;
+type Reply = Option<Frame>;
+type Sender = mpsc::Sender<(Frame, oneshot::Sender<Reply>)>;
+type Receiver = mpsc::Receiver<(Frame, oneshot::Sender<Reply>)>;
 
 struct Connection {
-    writer: BufWriter<OwnedWriteHalf>,
-    reader: BufReader<OwnedReadHalf>,
+    address: String,
+    stream: Option<TcpStream>,
 }
 
 impl Connection {
-    fn new(stream: TcpStream) -> Connection {
-        let (reader, writer) = stream.into_split();
+    fn new(address: &str) -> Connection {
         Connection {
-            writer: BufWriter::new(writer),
-            reader: BufReader::new(reader),
+            address: address.to_string(),
+            stream: None,
+        }
+    }
+
+    fn from_stream(stream: TcpStream, address: &str) -> Connection {
+        Connection {
+            address: address.to_string(),
+            stream: Some(stream),
+        }
+    }
+
+    async fn ensure_connection(&mut self) {
+        if self.stream.is_none() {
+            self.stream = TcpStream::connect(&self.address).await.ok();
         }
     }
 
     async fn read_frame_into(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // Read header
-        self.reader.read_exact(&mut buf[0..6]).await?;
-        // calculate payload size
-        let total_size = 6 + frame_size(&buf)?;
-        self.reader.read_exact(&mut buf[6..total_size]).await?;
-        Ok(total_size)
+        self.ensure_connection().await;
+        if let Some(mut stream) = self.stream.take() {
+            // Read header
+            stream.read_exact(&mut buf[0..6]).await?;
+            // calculate payload size
+            let total_size = 6 + frame_size(&buf)?;
+            stream.read_exact(&mut buf[6..total_size]).await?;
+            self.stream = Some(stream);
+            return Ok(total_size);
+        }
+        Err("no connection".into())
     }
 
     async fn write_frame(&mut self, buf: Frame) -> IOResult<()> {
-        self.writer.write_all(&buf[..]).await?;
-        self.writer.flush().await?;
+        self.ensure_connection().await;
+        if let Some(mut stream) = self.stream.take() {
+            stream.write_all(&buf[..]).await?;
+            self.stream = Some(stream);
+        }
         Ok(())
     }
 }
@@ -51,9 +69,11 @@ async fn handle_client(client: &mut Connection, channel: Sender) -> Result<()> {
         let size = client.read_frame_into(&mut buf).await?;
         let (tx, rx) = oneshot::channel();
         channel.send((buf[0..size].to_vec(), tx)).await.unwrap();
-        let frame = rx.await.unwrap();
-
-        client.write_frame(frame).await?;
+        if let Some(frame) = rx.await.unwrap() {
+            client.write_frame(frame).await?;
+        } else {
+            return Err("error".into());
+        }
     }
 }
 
@@ -63,13 +83,22 @@ struct Config {
 }
 
 async fn run(modbus_address: String, channel: &mut Receiver) {
-    let modbus = TcpStream::connect(modbus_address).await.unwrap();
-    let mut modbus = Connection::new(modbus);
+    let mut modbus = Connection::new(&modbus_address);
     let mut buf = [0; 8 * 1024];
     while let Some((frame, client)) = channel.recv().await {
-        modbus.write_frame(frame).await;
-        let size = modbus.read_frame_into(&mut buf).await.unwrap();
-        client.send(buf[0..size].to_vec());
+        let message = match modbus.write_frame(frame).await {
+            Ok(_) => {
+                let size = modbus.read_frame_into(&mut buf).await.unwrap();
+                Some(buf[0..size].to_vec())
+            }
+            Err(err) => {
+                eprintln!("Error writting frame to modbus device: {:?}", err);
+                None
+            }
+        };
+        if let Err(_) = client.send(message) {
+            eprintln!("Error sending message to client (maybe went away?)");
+        }
     }
 }
 
@@ -85,7 +114,7 @@ async fn server(config: Config) -> IOResult<()> {
     loop {
         let (client, client_addr) = listener.accept().await?;
         client.set_nodelay(true)?;
-        let mut client = Connection::new(client);
+        let mut client = Connection::from_stream(client, &client_addr.to_string());
         let tx = tx.clone();
         tokio::spawn(async move {
             match handle_client(&mut client, tx).await {
