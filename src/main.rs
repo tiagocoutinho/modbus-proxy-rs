@@ -13,7 +13,7 @@ type ReplySender = oneshot::Sender<Frame>;
 enum Message {
     Connection,
     Disconnection,
-    Packet(Frame, ReplySender),
+    Packet((Frame, ReplySender)),
 }
 
 type ChannelRx = mpsc::Receiver<Message>;
@@ -24,6 +24,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
+type Modbus = Option<(TcpReader, TcpWriter)>;
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
@@ -53,7 +54,7 @@ async fn client_task(client: TcpStream, channel: ChannelTx) {
     let (mut reader, mut writer) = split_connection(client);
     while let Ok(size) = read_frame_into(&mut reader, &mut buf).await {
         let (tx, rx) = oneshot::channel();
-        let message = Message::Packet(buf[0..size].to_vec(), tx);
+        let message = Message::Packet((buf[0..size].to_vec(), tx));
         if let Err(_) = channel.send(message).await {
             break;
         }
@@ -77,9 +78,24 @@ async fn client_task(client: TcpStream, channel: ChannelTx) {
     channel.send(Message::Disconnection).await;
 }
 
+async fn modbus_packet(modbus: Modbus, packet: (Frame, ReplySender)) -> Modbus {
+    let mut buf = [0; 8 * 1024];
+    match modbus {
+        Some((mut reader, mut writer)) => {
+            println!("sending to modbus {:?}", packet.0);
+            writer.write_all(&packet.0).await.unwrap();
+            writer.flush().await.unwrap();
+            let size = read_frame_into(&mut reader, &mut buf).await.unwrap();
+            println!("{:?}", &buf[0..size]);
+            packet.1.send(buf[0..size].to_vec());
+            Some((reader, writer))
+        }
+        None => modbus,
+    }
+}
+
 async fn modbus_task(address: &str, channel: &mut ChannelRx) {
     let mut nb_clients = 0;
-    let mut buf = [0; 8 * 1024];
     let mut modbus: Option<(TcpReader, TcpWriter)> = None;
 
     while let Some(message) = channel.recv().await {
@@ -98,17 +114,9 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
                     modbus = None;
                 }
             }
-            Message::Packet(frame, reply) => match modbus.as_mut() {
-                Some((reader, writer)) => {
-                    println!("sending to modbus {:?}", frame);
-                    writer.write_all(&frame).await.unwrap();
-                    writer.flush().await.unwrap();
-                    let size = read_frame_into(reader, &mut buf).await.unwrap();
-                    println!("{:?}", &buf[0..size]);
-                    reply.send(buf[0..size].to_vec());
-                }
-                None => {}
-            },
+            Message::Packet(packet) => {
+                modbus = modbus_packet(modbus, packet).await;
+            }
         }
     }
 }
