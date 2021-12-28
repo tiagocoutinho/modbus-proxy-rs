@@ -60,7 +60,10 @@ async fn client_task(client: TcpStream, channel: ChannelTx) {
         match rx.await {
             Ok(frame) => {
                 if let Err(err) = writer.write_all(&frame).await {
-                    eprintln!("client: error writing reply to client (maybe disconnected?)");
+                    eprintln!(
+                        "client: error writing reply to client (maybe disconnected?): {:?}",
+                        err
+                    );
                     break;
                 }
                 writer.flush().await.unwrap();
@@ -118,7 +121,7 @@ async fn bridge_task(config: Config) {
         modbus_task(&config.modbus_address, &mut rx).await;
     });
     loop {
-        let (mut client, client_addr) = listener.accept().await.unwrap();
+        let (client, _) = listener.accept().await.unwrap();
         let tx = tx.clone();
         tokio::spawn(async move {
             client_task(client, tx).await;
@@ -128,7 +131,6 @@ async fn bridge_task(config: Config) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    //-> IOResult<()> {
     let config = Config {
         bind_address: "127.0.0.1:8080".to_string(),
         modbus_address: "127.0.0.1:5030".to_string(),
