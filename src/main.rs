@@ -1,135 +1,133 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Result as IOResult};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-
-type Error = Box<dyn std::error::Error>;
-type Result<T> = std::result::Result<T, Error>;
-type Frame = Vec<u8>;
-type Reply = Option<Frame>;
-type Sender = mpsc::Sender<(Frame, oneshot::Sender<Reply>)>;
-type Receiver = mpsc::Receiver<(Frame, oneshot::Sender<Reply>)>;
-
-struct Connection {
-    address: String,
-    stream: Option<TcpStream>,
-}
-
-impl Connection {
-    fn new(address: &str) -> Connection {
-        Connection {
-            address: address.to_string(),
-            stream: None,
-        }
-    }
-
-    fn from_stream(stream: TcpStream, address: &str) -> Connection {
-        Connection {
-            address: address.to_string(),
-            stream: Some(stream),
-        }
-    }
-
-    async fn ensure_connection(&mut self) {
-        if self.stream.is_none() {
-            self.stream = TcpStream::connect(&self.address).await.ok();
-        }
-    }
-
-    async fn read_frame_into(&mut self, buf: &mut [u8]) -> Result<usize> {
-        self.ensure_connection().await;
-        if let Some(mut stream) = self.stream.take() {
-            // Read header
-            stream.read_exact(&mut buf[0..6]).await?;
-            // calculate payload size
-            let total_size = 6 + frame_size(&buf)?;
-            stream.read_exact(&mut buf[6..total_size]).await?;
-            self.stream = Some(stream);
-            return Ok(total_size);
-        }
-        Err("no connection".into())
-    }
-
-    async fn write_frame(&mut self, buf: Frame) -> IOResult<()> {
-        self.ensure_connection().await;
-        if let Some(mut stream) = self.stream.take() {
-            stream.write_all(&buf[..]).await?;
-            self.stream = Some(stream);
-        }
-        Ok(())
-    }
-}
-
-fn frame_size(frame: &[u8]) -> Result<usize> {
-    Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
-}
-
-async fn handle_client(client: &mut Connection, channel: Sender) -> Result<()> {
-    let mut buf = [0; 8 * 1024];
-    loop {
-        let size = client.read_frame_into(&mut buf).await?;
-        let (tx, rx) = oneshot::channel();
-        channel.send((buf[0..size].to_vec(), tx)).await.unwrap();
-        if let Some(frame) = rx.await.unwrap() {
-            client.write_frame(frame).await?;
-        } else {
-            return Err("error".into());
-        }
-    }
-}
 
 struct Config {
     bind_address: String,
     modbus_address: String,
 }
 
-async fn run(modbus_address: String, channel: &mut Receiver) {
-    let mut modbus = Connection::new(&modbus_address);
+type Frame = Vec<u8>;
+type ReplySender = oneshot::Sender<Frame>;
+
+enum Message {
+    Connection,
+    Disconnection,
+    Packet(Frame, ReplySender),
+}
+
+type ChannelRx = mpsc::Receiver<Message>;
+type ChannelTx = mpsc::Sender<Message>;
+
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+type Result<T> = std::result::Result<T, Error>;
+
+type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
+type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
+
+fn frame_size(frame: &[u8]) -> Result<usize> {
+    Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
+}
+
+async fn read_frame_into(stream: &mut TcpReader, buf: &mut [u8]) -> Result<usize> {
+    // Read header
+    stream.read_exact(&mut buf[0..6]).await?;
+    // calculate payload size
+    let total_size = 6 + frame_size(&buf)?;
+    stream.read_exact(&mut buf[6..total_size]).await?;
+    Ok(total_size)
+}
+
+async fn client_task(client: TcpStream, channel: ChannelTx) {
+    channel.send(Message::Connection).await;
     let mut buf = [0; 8 * 1024];
-    while let Some((frame, client)) = channel.recv().await {
-        let message = match modbus.write_frame(frame).await {
-            Ok(_) => {
-                let size = modbus.read_frame_into(&mut buf).await.unwrap();
-                Some(buf[0..size].to_vec())
+    let (reader, writer) = client.into_split();
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
+    while let Ok(size) = read_frame_into(&mut reader, &mut buf).await {
+        let (tx, rx) = oneshot::channel();
+        let message = Message::Packet(buf[0..size].to_vec(), tx);
+        if let Err(_) = channel.send(message).await {
+            break;
+        }
+        match rx.await {
+            Ok(frame) => {
+                if let Err(err) = writer.write_all(&frame).await {
+                    eprintln!("client: error writing reply to client (maybe disconnected?)");
+                    break;
+                }
+                writer.flush().await.unwrap();
             }
             Err(err) => {
-                eprintln!("Error writting frame to modbus device: {:?}", err);
-                None
+                eprintln!("client: error waiting for modbus reply: {}", err);
+                break;
             }
-        };
-        if let Err(_) = client.send(message) {
-            eprintln!("Error sending message to client (maybe went away?)");
+        }
+    }
+    channel.send(Message::Disconnection).await;
+}
+
+async fn modbus_task(address: &str, channel: &mut ChannelRx) {
+    let mut nb_clients = 0;
+    let mut buf = [0; 8 * 1024];
+    let mut modbus: Option<(TcpReader, TcpWriter)> = None;
+
+    while let Some(message) = channel.recv().await {
+        match message {
+            Message::Connection => {
+                println!("connecting to modbus at {}...", address);
+                nb_clients += 1;
+                let stream = TcpStream::connect(address).await.unwrap();
+                let (reader, writer) = stream.into_split();
+                let reader = BufReader::new(reader);
+                let writer = BufWriter::new(writer);
+                modbus = Some((reader, writer));
+                println!("connected to modbus at {}!", address);
+            }
+            Message::Disconnection => {
+                nb_clients -= 1;
+                if nb_clients == 0 {
+                    println!("disconnecting from modbus at {} (no clients)", address);
+                    modbus = None;
+                }
+            }
+            Message::Packet(frame, reply) => match modbus.as_mut() {
+                Some((reader, writer)) => {
+                    println!("sending to modbus {:?}", frame);
+                    writer.write_all(&frame).await.unwrap();
+                    writer.flush().await.unwrap();
+                    let size = read_frame_into(reader, &mut buf).await.unwrap();
+                    println!("{:?}", &buf[0..size]);
+                    reply.send(buf[0..size].to_vec());
+                }
+                None => {}
+            },
         }
     }
 }
 
-async fn server(config: Config) -> IOResult<()> {
-    let listener = TcpListener::bind(config.bind_address).await?;
-    let (tx, mut rx) = mpsc::channel(32);
+async fn bridge_task(config: Config) {
+    let listener = TcpListener::bind(config.bind_address).await.unwrap();
+    let (tx, mut rx) = mpsc::channel::<Message>(32);
 
-    let modbus_address = config.modbus_address;
     tokio::spawn(async move {
-        run(modbus_address, &mut rx).await;
+        modbus_task(&config.modbus_address, &mut rx).await;
     });
-
     loop {
-        let (client, client_addr) = listener.accept().await?;
-        client.set_nodelay(true)?;
-        let mut client = Connection::from_stream(client, &client_addr.to_string());
+        let (mut client, client_addr) = listener.accept().await.unwrap();
         let tx = tx.clone();
         tokio::spawn(async move {
-            match handle_client(&mut client, tx).await {
-                Err(err) => eprintln!("Error {}: {:?}", client_addr, err),
-                _ => {}
-            }
+            client_task(client, tx).await;
         });
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> IOResult<()> {
+async fn main() {
+    //-> IOResult<()> {
     let config = Config {
         bind_address: "127.0.0.1:8080".to_string(),
         modbus_address: "127.0.0.1:5030".to_string(),
     };
-    server(config).await
+    bridge_task(config).await
 }
