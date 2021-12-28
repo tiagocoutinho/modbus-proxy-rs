@@ -29,6 +29,15 @@ fn frame_size(frame: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
 }
 
+fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
+    let (reader, writer) = stream.into_split();
+    (BufReader::new(reader), BufWriter::new(writer))
+}
+
+async fn create_connection(address: &str) -> Result<(TcpReader, TcpWriter)> {
+    Ok(split_connection(TcpStream::connect(address).await?))
+}
+
 async fn read_frame_into(stream: &mut TcpReader, buf: &mut [u8]) -> Result<usize> {
     // Read header
     stream.read_exact(&mut buf[0..6]).await?;
@@ -41,9 +50,7 @@ async fn read_frame_into(stream: &mut TcpReader, buf: &mut [u8]) -> Result<usize
 async fn client_task(client: TcpStream, channel: ChannelTx) {
     channel.send(Message::Connection).await;
     let mut buf = [0; 8 * 1024];
-    let (reader, writer) = client.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = BufWriter::new(writer);
+    let (mut reader, mut writer) = split_connection(client);
     while let Ok(size) = read_frame_into(&mut reader, &mut buf).await {
         let (tx, rx) = oneshot::channel();
         let message = Message::Packet(buf[0..size].to_vec(), tx);
@@ -77,10 +84,7 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
             Message::Connection => {
                 println!("connecting to modbus at {}...", address);
                 nb_clients += 1;
-                let stream = TcpStream::connect(address).await.unwrap();
-                let (reader, writer) = stream.into_split();
-                let reader = BufReader::new(reader);
-                let writer = BufWriter::new(writer);
+                let (reader, writer) = create_connection(address).await.unwrap();
                 modbus = Some((reader, writer));
                 println!("connected to modbus at {}!", address);
             }
