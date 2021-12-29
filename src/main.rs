@@ -10,6 +10,7 @@ struct Config {
 type Frame = Vec<u8>;
 type ReplySender = oneshot::Sender<Frame>;
 
+#[derive(Debug)]
 enum Message {
     Connection,
     Disconnection,
@@ -45,6 +46,10 @@ impl Modbus {
     fn disconnect(&mut self) {
         self.stream = None;
     }
+
+    fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
 }
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
@@ -71,44 +76,53 @@ async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
     Ok(buf)
 }
 
-async fn client_task(client: TcpStream, channel: ChannelTx) {
-    channel.send(Message::Connection).await;
+async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
+    channel.send(Message::Connection).await?;
     let (mut reader, mut writer) = split_connection(client);
     while let Ok(buf) = read_frame(&mut reader).await {
         let (tx, rx) = oneshot::channel();
-        let message = Message::Packet((buf, tx));
-        if let Err(_) = channel.send(message).await {
-            break;
-        }
-        match rx.await {
-            Ok(frame) => {
-                if let Err(err) = writer.write_all(&frame).await {
-                    eprintln!(
-                        "client: error writing reply to client (maybe disconnected?): {:?}",
-                        err
-                    );
-                    break;
-                }
-                writer.flush().await.unwrap();
-            }
-            Err(err) => {
-                eprintln!("client: error waiting for modbus reply: {}", err);
-                break;
-            }
-        }
+        channel.send(Message::Packet((buf, tx))).await?;
+        writer.write_all(&rx.await?).await?;
+        writer.flush().await?;
     }
-    channel.send(Message::Disconnection).await;
+    channel.send(Message::Disconnection).await?;
+    Ok(())
 }
 
-async fn modbus_packet(modbus: &mut Modbus, packet: (Frame, ReplySender)) {
-    if let Some((reader, writer)) = modbus.stream.as_mut() {
-        println!("sending to modbus {:?}", packet.0);
-        writer.write_all(&packet.0).await.unwrap();
-        writer.flush().await.unwrap();
-        let buf = read_frame(reader).await.unwrap();
-        println!("{:?}", buf);
-        packet.1.send(buf);
+async fn modbus_write_read_raw(modbus: &mut Modbus, frame: &Frame) -> Result<Frame> {
+    let (reader, writer) = modbus.stream.as_mut().ok_or("no modbus connection")?;
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    read_frame(reader).await
+}
+
+async fn modbus_write_read_frame(modbus: &mut Modbus, frame: &Frame) -> Result<Frame> {
+    match modbus.is_connected() {
+        true => {
+            let result = modbus_write_read_raw(modbus, &frame).await;
+            match result {
+                Ok(reply) => Ok(reply),
+                Err(error) => {
+                    eprintln!("modbus error ({:?}). Retrying...", error);
+                    modbus.reconnect().await;
+                    modbus_write_read_raw(modbus, &frame).await
+                }
+            }
+        }
+        false => {
+            modbus.reconnect().await;
+            modbus_write_read_raw(modbus, &frame).await
+        }
     }
+}
+
+async fn modbus_packet(modbus: &mut Modbus, packet: (Frame, ReplySender)) -> Result<()> {
+    let (frame, channel) = packet;
+    println!("modbus request: {:?}", frame);
+    let reply = modbus_write_read_frame(modbus, &frame).await?;
+    println!("modbus reply: {:?}", reply);
+    channel.send(reply);
+    Ok(())
 }
 
 async fn modbus_task(address: &str, channel: &mut ChannelRx) {
@@ -118,10 +132,12 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
     while let Some(message) = channel.recv().await {
         match message {
             Message::Connection => {
-                println!("connecting to modbus at {}...", address);
                 nb_clients += 1;
-                modbus.reconnect().await;
-                println!("connected to modbus at {}!", address);
+                if !modbus.is_connected() {
+                    println!("connecting to modbus at {}...", address);
+                    modbus.reconnect().await;
+                    println!("connected to modbus at {}!", address);
+                }
             }
             Message::Disconnection => {
                 nb_clients -= 1;
@@ -131,7 +147,9 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
                 }
             }
             Message::Packet(packet) => {
-                modbus_packet(&mut modbus, packet).await;
+                if let Err(_) = modbus_packet(&mut modbus, packet).await {
+                    modbus.disconnect();
+                }
             }
         }
     }
@@ -148,7 +166,9 @@ async fn bridge_task(config: Config) {
         let (client, _) = listener.accept().await.unwrap();
         let tx = tx.clone();
         tokio::spawn(async move {
-            client_task(client, tx).await;
+            if let Err(err) = client_task(client, tx).await {
+                eprintln!("Client error: {:?}", err);
+            }
         });
     }
 }
