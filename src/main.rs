@@ -1,3 +1,6 @@
+#[macro_use]
+extern crate log;
+
 use structopt::StructOpt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -53,11 +56,13 @@ impl Modbus {
     async fn connect(&mut self) -> Result<()> {
         match create_connection(&self.address).await {
             Ok(connection) => {
+                info!("modbus connection to {} sucessfull", self.address);
                 self.stream = Some(connection);
                 Ok(())
             }
             Err(error) => {
                 self.stream = None;
+                info!("modbus connection to {} error: {} ", self.address, error);
                 Err(error)
             }
         }
@@ -84,7 +89,7 @@ impl Modbus {
             match result {
                 Ok(reply) => Ok(reply),
                 Err(error) => {
-                    eprintln!("modbus error ({:?}). Retrying...", error);
+                    warn!("modbus error: {}. Retrying...", error);
                     self.connect().await?;
                     self.raw_write_read(&frame).await
                 }
@@ -137,7 +142,11 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
 }
 
 async fn modbus_packet(modbus: &mut Modbus, frame: Frame, channel: ReplySender) -> Result<()> {
+    info!("modbus request {}: {} bytes", modbus.address, frame.len());
+    debug!("modbus request {}: {:?}", modbus.address, &frame[..]);
     let reply = modbus.write_read(&frame).await?;
+    info!("modbus reply {}: {} bytes", modbus.address, reply.len());
+    debug!("modbus reply {}: {:?}", modbus.address, &reply[..]);
     channel
         .send(reply)
         .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
@@ -151,11 +160,13 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
         match message {
             Message::Connection => {
                 nb_clients += 1;
+                info!("new client connection (active = {})", nb_clients);
             }
             Message::Disconnection => {
                 nb_clients -= 1;
+                info!("client disconnection (active = {})", nb_clients);
                 if nb_clients == 0 {
-                    eprintln!("disconnecting from modbus at {} (no clients)", address);
+                    info!("disconnecting from modbus at {} (no clients)", address);
                     modbus.disconnect();
                 }
             }
@@ -169,18 +180,23 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
 }
 
 async fn bridge_task(config: Config) {
-    let listener = TcpListener::bind(config.bind_address).await.unwrap();
+    let modbus_address = config.modbus_address.clone();
+    let listener = TcpListener::bind(&config.bind_address).await.unwrap();
     let (tx, mut rx) = mpsc::channel::<Message>(32);
 
     tokio::spawn(async move {
         modbus_task(&config.modbus_address, &mut rx).await;
     });
+    info!(
+        "Ready to accept requests on {} to {}",
+        &config.bind_address, &modbus_address
+    );
     loop {
         let (client, _) = listener.accept().await.unwrap();
         let tx = tx.clone();
         tokio::spawn(async move {
             if let Err(err) = client_task(client, tx).await {
-                eprintln!("Client error: {:?}", err);
+                error!("Client error: {:?}", err);
             }
         });
     }
@@ -188,6 +204,7 @@ async fn bridge_task(config: Config) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    env_logger::init();
     let config = Config::from_args();
     bridge_task(config).await
 }
