@@ -39,8 +39,17 @@ impl Modbus {
         }
     }
 
-    async fn reconnect(&mut self) {
-        self.stream = create_connection(&self.address).await.ok();
+    async fn connect(&mut self) -> Result<()> {
+        match create_connection(&self.address).await {
+            Ok(connection) => {
+                self.stream = Some(connection);
+                Ok(())
+            }
+            Err(error) => {
+                self.stream = None;
+                Err(error)
+            }
+        }
     }
 
     fn disconnect(&mut self) {
@@ -97,22 +106,19 @@ async fn modbus_write_read_raw(modbus: &mut Modbus, frame: &Frame) -> Result<Fra
 }
 
 async fn modbus_write_read_frame(modbus: &mut Modbus, frame: &Frame) -> Result<Frame> {
-    match modbus.is_connected() {
-        true => {
-            let result = modbus_write_read_raw(modbus, &frame).await;
-            match result {
-                Ok(reply) => Ok(reply),
-                Err(error) => {
-                    eprintln!("modbus error ({:?}). Retrying...", error);
-                    modbus.reconnect().await;
-                    modbus_write_read_raw(modbus, &frame).await
-                }
+    if modbus.is_connected() {
+        let result = modbus_write_read_raw(modbus, &frame).await;
+        match result {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                eprintln!("modbus error ({:?}). Retrying...", error);
+                modbus.connect().await?;
+                modbus_write_read_raw(modbus, &frame).await
             }
         }
-        false => {
-            modbus.reconnect().await;
-            modbus_write_read_raw(modbus, &frame).await
-        }
+    } else {
+        modbus.connect().await?;
+        modbus_write_read_raw(modbus, &frame).await
     }
 }
 
@@ -133,11 +139,6 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
         match message {
             Message::Connection => {
                 nb_clients += 1;
-                if !modbus.is_connected() {
-                    println!("connecting to modbus at {}...", address);
-                    modbus.reconnect().await;
-                    println!("connected to modbus at {}!", address);
-                }
             }
             Message::Disconnection => {
                 nb_clients -= 1;
