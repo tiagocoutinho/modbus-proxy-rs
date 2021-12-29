@@ -14,7 +14,7 @@ type ReplySender = oneshot::Sender<Frame>;
 enum Message {
     Connection,
     Disconnection,
-    Packet((Frame, ReplySender)),
+    Packet(Frame, ReplySender),
 }
 
 type ChannelRx = mpsc::Receiver<Message>;
@@ -59,6 +59,30 @@ impl Modbus {
     fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
+
+    async fn raw_write_read(&mut self, frame: &Frame) -> Result<Frame> {
+        let (reader, writer) = self.stream.as_mut().ok_or("no modbus connection")?;
+        writer.write_all(&frame).await?;
+        writer.flush().await?;
+        read_frame(reader).await
+    }
+
+    async fn write_read(&mut self, frame: &Frame) -> Result<Frame> {
+        if self.is_connected() {
+            let result = self.raw_write_read(&frame).await;
+            match result {
+                Ok(reply) => Ok(reply),
+                Err(error) => {
+                    eprintln!("modbus error ({:?}). Retrying...", error);
+                    self.connect().await?;
+                    self.raw_write_read(&frame).await
+                }
+            }
+        } else {
+            self.connect().await?;
+            self.raw_write_read(&frame).await
+        }
+    }
 }
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
@@ -90,7 +114,7 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
     let (mut reader, mut writer) = split_connection(client);
     while let Ok(buf) = read_frame(&mut reader).await {
         let (tx, rx) = oneshot::channel();
-        channel.send(Message::Packet((buf, tx))).await?;
+        channel.send(Message::Packet(buf, tx)).await?;
         writer.write_all(&rx.await?).await?;
         writer.flush().await?;
     }
@@ -98,37 +122,11 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
     Ok(())
 }
 
-async fn modbus_write_read_raw(modbus: &mut Modbus, frame: &Frame) -> Result<Frame> {
-    let (reader, writer) = modbus.stream.as_mut().ok_or("no modbus connection")?;
-    writer.write_all(&frame).await?;
-    writer.flush().await?;
-    read_frame(reader).await
-}
-
-async fn modbus_write_read_frame(modbus: &mut Modbus, frame: &Frame) -> Result<Frame> {
-    if modbus.is_connected() {
-        let result = modbus_write_read_raw(modbus, &frame).await;
-        match result {
-            Ok(reply) => Ok(reply),
-            Err(error) => {
-                eprintln!("modbus error ({:?}). Retrying...", error);
-                modbus.connect().await?;
-                modbus_write_read_raw(modbus, &frame).await
-            }
-        }
-    } else {
-        modbus.connect().await?;
-        modbus_write_read_raw(modbus, &frame).await
-    }
-}
-
-async fn modbus_packet(modbus: &mut Modbus, packet: (Frame, ReplySender)) -> Result<()> {
-    let (frame, channel) = packet;
-    println!("modbus request: {:?}", frame);
-    let reply = modbus_write_read_frame(modbus, &frame).await?;
-    println!("modbus reply: {:?}", reply);
-    channel.send(reply);
-    Ok(())
+async fn modbus_packet(modbus: &mut Modbus, frame: Frame, channel: ReplySender) -> Result<()> {
+    let reply = modbus.write_read(&frame).await?;
+    channel
+        .send(reply)
+        .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
 }
 
 async fn modbus_task(address: &str, channel: &mut ChannelRx) {
@@ -143,12 +141,12 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
             Message::Disconnection => {
                 nb_clients -= 1;
                 if nb_clients == 0 {
-                    println!("disconnecting from modbus at {} (no clients)", address);
+                    eprintln!("disconnecting from modbus at {} (no clients)", address);
                     modbus.disconnect();
                 }
             }
-            Message::Packet(packet) => {
-                if let Err(_) = modbus_packet(&mut modbus, packet).await {
+            Message::Packet(frame, channel) => {
+                if let Err(_) = modbus_packet(&mut modbus, frame, channel).await {
                     modbus.disconnect();
                 }
             }
