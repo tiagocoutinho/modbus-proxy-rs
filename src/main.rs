@@ -45,10 +45,6 @@ impl Modbus {
     fn disconnect(&mut self) {
         self.stream = None;
     }
-
-    fn connected(&self) -> bool {
-        self.stream.is_some()
-    }
 }
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
@@ -64,22 +60,23 @@ async fn create_connection(address: &str) -> Result<(TcpReader, TcpWriter)> {
     Ok(split_connection(TcpStream::connect(address).await?))
 }
 
-async fn read_frame_into(stream: &mut TcpReader, buf: &mut [u8]) -> Result<usize> {
+async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
+    let mut buf = vec![0u8; 6];
     // Read header
-    stream.read_exact(&mut buf[0..6]).await?;
+    stream.read_exact(&mut buf).await?;
     // calculate payload size
     let total_size = 6 + frame_size(&buf)?;
+    buf.resize(total_size, 0);
     stream.read_exact(&mut buf[6..total_size]).await?;
-    Ok(total_size)
+    Ok(buf)
 }
 
 async fn client_task(client: TcpStream, channel: ChannelTx) {
     channel.send(Message::Connection).await;
-    let mut buf = [0; 8 * 1024];
     let (mut reader, mut writer) = split_connection(client);
-    while let Ok(size) = read_frame_into(&mut reader, &mut buf).await {
+    while let Ok(buf) = read_frame(&mut reader).await {
         let (tx, rx) = oneshot::channel();
-        let message = Message::Packet((buf[0..size].to_vec(), tx));
+        let message = Message::Packet((buf, tx));
         if let Err(_) = channel.send(message).await {
             break;
         }
@@ -104,14 +101,13 @@ async fn client_task(client: TcpStream, channel: ChannelTx) {
 }
 
 async fn modbus_packet(modbus: &mut Modbus, packet: (Frame, ReplySender)) {
-    if let Some(rw) = modbus.stream.as_mut() {
-        let mut buf = [0; 8 * 1024];
+    if let Some((reader, writer)) = modbus.stream.as_mut() {
         println!("sending to modbus {:?}", packet.0);
-        rw.1.write_all(&packet.0).await.unwrap();
-        rw.1.flush().await.unwrap();
-        let size = read_frame_into(&mut rw.0, &mut buf).await.unwrap();
-        println!("{:?}", &buf[0..size]);
-        packet.1.send(buf[0..size].to_vec());
+        writer.write_all(&packet.0).await.unwrap();
+        writer.flush().await.unwrap();
+        let buf = read_frame(reader).await.unwrap();
+        println!("{:?}", buf);
+        packet.1.send(buf);
     }
 }
 
