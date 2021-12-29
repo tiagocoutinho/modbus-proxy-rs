@@ -1,9 +1,20 @@
+use structopt::StructOpt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "modbus proxy",
+    about = "Connect multiple clients to modbus devices"
+)]
 struct Config {
+    #[structopt(short = "b", long = "bind", help = "listen TCP address (ex: 0:5020)")]
     bind_address: String,
+    #[structopt(
+        long = "modbus",
+        help = "modbus device TCP address (ex: plc.acme.org:502)"
+    )]
     modbus_address: String,
 }
 
@@ -177,9 +188,6 @@ async fn bridge_task(config: Config) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let config = Config {
-        bind_address: "127.0.0.1:8080".to_string(),
-        modbus_address: "127.0.0.1:5030".to_string(),
-    };
+    let config = Config::from_args();
     bridge_task(config).await
 }
