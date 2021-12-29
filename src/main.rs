@@ -24,7 +24,32 @@ type Result<T> = std::result::Result<T, Error>;
 
 type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
-type Modbus = Option<(TcpReader, TcpWriter)>;
+
+struct Modbus {
+    address: String,
+    stream: Option<(TcpReader, TcpWriter)>,
+}
+
+impl Modbus {
+    fn new(address: &str) -> Modbus {
+        Modbus {
+            address: address.to_string(),
+            stream: None,
+        }
+    }
+
+    async fn reconnect(&mut self) {
+        self.stream = create_connection(&self.address).await.ok();
+    }
+
+    fn disconnect(&mut self) {
+        self.stream = None;
+    }
+
+    fn connected(&self) -> bool {
+        self.stream.is_some()
+    }
+}
 
 fn frame_size(frame: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
@@ -78,44 +103,39 @@ async fn client_task(client: TcpStream, channel: ChannelTx) {
     channel.send(Message::Disconnection).await;
 }
 
-async fn modbus_packet(modbus: Modbus, packet: (Frame, ReplySender)) -> Modbus {
-    let mut buf = [0; 8 * 1024];
-    match modbus {
-        Some((mut reader, mut writer)) => {
-            println!("sending to modbus {:?}", packet.0);
-            writer.write_all(&packet.0).await.unwrap();
-            writer.flush().await.unwrap();
-            let size = read_frame_into(&mut reader, &mut buf).await.unwrap();
-            println!("{:?}", &buf[0..size]);
-            packet.1.send(buf[0..size].to_vec());
-            Some((reader, writer))
-        }
-        None => modbus,
+async fn modbus_packet(modbus: &mut Modbus, packet: (Frame, ReplySender)) {
+    if let Some(rw) = modbus.stream.as_mut() {
+        let mut buf = [0; 8 * 1024];
+        println!("sending to modbus {:?}", packet.0);
+        rw.1.write_all(&packet.0).await.unwrap();
+        rw.1.flush().await.unwrap();
+        let size = read_frame_into(&mut rw.0, &mut buf).await.unwrap();
+        println!("{:?}", &buf[0..size]);
+        packet.1.send(buf[0..size].to_vec());
     }
 }
 
 async fn modbus_task(address: &str, channel: &mut ChannelRx) {
     let mut nb_clients = 0;
-    let mut modbus: Option<(TcpReader, TcpWriter)> = None;
+    let mut modbus = Modbus::new(address);
 
     while let Some(message) = channel.recv().await {
         match message {
             Message::Connection => {
                 println!("connecting to modbus at {}...", address);
                 nb_clients += 1;
-                let (reader, writer) = create_connection(address).await.unwrap();
-                modbus = Some((reader, writer));
+                modbus.reconnect().await;
                 println!("connected to modbus at {}!", address);
             }
             Message::Disconnection => {
                 nb_clients -= 1;
                 if nb_clients == 0 {
                     println!("disconnecting from modbus at {} (no clients)", address);
-                    modbus = None;
+                    modbus.disconnect();
                 }
             }
             Message::Packet(packet) => {
-                modbus = modbus_packet(modbus, packet).await;
+                modbus_packet(&mut modbus, packet).await;
             }
         }
     }
