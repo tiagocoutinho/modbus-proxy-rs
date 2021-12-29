@@ -95,7 +95,9 @@ fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
 }
 
 async fn create_connection(address: &str) -> Result<(TcpReader, TcpWriter)> {
-    Ok(split_connection(TcpStream::connect(address).await?))
+    let stream = TcpStream::connect(address).await?;
+    stream.set_nodelay(true)?;
+    Ok(split_connection(stream))
 }
 
 async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
@@ -110,6 +112,7 @@ async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
 }
 
 async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
+    client.set_nodelay(true)?;
     channel.send(Message::Connection).await?;
     let (mut reader, mut writer) = split_connection(client);
     while let Ok(buf) = read_frame(&mut reader).await {
