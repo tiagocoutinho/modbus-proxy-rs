@@ -1,4 +1,4 @@
-FROM rust:1.57-slim-buster as build
+FROM rust:1.57-slim-bullseye as build
 
 # 1. Create a new empty shell project
 RUN USER=root cargo new --bin modbus-proxy-rs
@@ -20,7 +20,7 @@ RUN rm ./target/release/deps/modbus_proxy_rs*
 RUN cargo build --release
 
 # our final base
-FROM rust:1.57-slim-buster
+FROM debian:bullseye-slim
 
 # copy the build artifact from the build stage
 COPY --from=build /modbus-proxy-rs/target/release/modbus-proxy-rs .
