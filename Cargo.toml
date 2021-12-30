@@ -2,11 +2,22 @@
 name = "modbus-proxy-rs"
 version = "0.1.0"
 edition = "2021"
+authors = [ "Tiago Coutinho <coutinhotiago@gmail.com>",]
+description = "Modbus TCP proxy"
+homepage = "https://github.com/tiagocoutinho/modbus-proxy-rs"
+repository = "https://github.com/tiagocoutinho/modbus-proxy-rs"
+readme = "README.md"
+rust-version = "1.56"
+keywords = [ "modbus", "TCP", "proxy", "bridge" ]
+categories = ["network-programming"]
+license = "GPL-3.0-or-later"
+publish = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[badges]
+maintenance = { status = "experimental" }
 
 [dependencies]
 tokio = { version = "1.15.0", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
-structopt = "0.3"
-log = "0.4"
-env_logger = "0.9"
+structopt = "0.3.25"
+log = "0.4.14"
+env_logger = "0.9.0"
