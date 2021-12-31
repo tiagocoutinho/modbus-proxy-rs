@@ -6,6 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+// Use Jemalloc only for musl-64 bits platforms
+#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 #[derive(Debug, StructOpt)]
 #[structopt(
     name = "modbus proxy",

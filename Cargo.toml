@@ -21,3 +21,6 @@ tokio = { version = "1.15", features = ["rt", "net", "macros", "io-util", "sync"
 structopt = "0.3"
 log = "0.4"
 env_logger = "0.9"
+
+[target.'cfg(all(target_env = "musl", target_pointer_width = "64"))'.dependencies.jemallocator]
+version = "0.3"
