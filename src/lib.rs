@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate log;
 
-use config::{Config, ConfigError};
+use futures::future::join_all;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -32,39 +32,52 @@ type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
 
 #[derive(Debug, Deserialize)]
-struct Listen {
-    bind: String,
+pub struct Listen {
+    pub bind: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct Modbus {
+pub struct Device {
     url: String,
     #[serde(skip)]
     stream: Option<(TcpReader, TcpWriter)>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Device {
-    listen: Listen,
-    modbus: Modbus,
+pub struct Bridge {
+    pub listen: Listen,
+    pub modbus: Device,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Settings {
-    pub devices: Vec<Device>,
+pub struct Server {
+    pub bridges: Vec<Bridge>,
 }
 
-impl Settings {
-    pub fn new(config_file: &str) -> std::result::Result<Self, ConfigError> {
-        let mut cfg = Config::new();
+impl Server {
+    pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
+        let mut cfg = config::Config::new();
         cfg.merge(config::File::with_name(config_file)).unwrap();
         cfg.try_into()
     }
+
+    pub async fn run(&mut self) {
+        let tasks = self
+            .bridges
+            .drain(..)
+            .map(|bridge| tokio::spawn(bridge.run()))
+            .collect::<Vec<_>>();
+        join_all(tasks).await;
+    }
+
+    pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
+        Ok(Self::new(config_file)?.run().await)
+    }
 }
 
-impl Modbus {
-    fn new(url: &str) -> Modbus {
-        Modbus {
+impl Device {
+    pub fn new(url: &str) -> Device {
+        Device {
             url: url.to_string(),
             stream: None,
         }
@@ -158,12 +171,12 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
     Ok(())
 }
 
-async fn modbus_packet(modbus: &mut Modbus, frame: Frame, channel: ReplySender) -> Result<()> {
-    info!("modbus request {}: {} bytes", modbus.url, frame.len());
-    debug!("modbus request {}: {:?}", modbus.url, &frame[..]);
-    let reply = modbus.write_read(&frame).await?;
-    info!("modbus reply {}: {} bytes", modbus.url, reply.len());
-    debug!("modbus reply {}: {:?}", modbus.url, &reply[..]);
+async fn modbus_packet(device: &mut Device, frame: Frame, channel: ReplySender) -> Result<()> {
+    info!("modbus request {}: {} bytes", device.url, frame.len());
+    debug!("modbus request {}: {:?}", device.url, &frame[..]);
+    let reply = device.write_read(&frame).await?;
+    info!("modbus reply {}: {} bytes", device.url, reply.len());
+    debug!("modbus reply {}: {:?}", device.url, &reply[..]);
     channel
         .send(reply)
         .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
@@ -171,7 +184,7 @@ async fn modbus_packet(modbus: &mut Modbus, frame: Frame, channel: ReplySender) 
 
 async fn modbus_task(url: &str, channel: &mut ChannelRx) {
     let mut nb_clients = 0;
-    let mut modbus = Modbus::new(url);
+    let mut device = Device::new(url);
 
     while let Some(message) = channel.recv().await {
         match message {
@@ -184,37 +197,39 @@ async fn modbus_task(url: &str, channel: &mut ChannelRx) {
                 info!("client disconnection (active = {})", nb_clients);
                 if nb_clients == 0 {
                     info!("disconnecting from modbus at {} (no clients)", url);
-                    modbus.disconnect();
+                    device.disconnect();
                 }
             }
             Message::Packet(frame, channel) => {
-                if let Err(_) = modbus_packet(&mut modbus, frame, channel).await {
-                    modbus.disconnect();
+                if let Err(_) = modbus_packet(&mut device, frame, channel).await {
+                    device.disconnect();
                 }
             }
         }
     }
 }
 
-pub async fn bridge_task(device: Device) {
-    let modbus_url = device.modbus.url.clone();
-    let listener = TcpListener::bind(&device.listen.bind).await.unwrap();
-    let (tx, mut rx) = mpsc::channel::<Message>(32);
+impl Bridge {
+    pub async fn run(self) {
+        let modbus_url = self.modbus.url.clone();
+        let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<Message>(32);
 
-    tokio::spawn(async move {
-        modbus_task(&modbus_url, &mut rx).await;
-    });
-    info!(
-        "Ready to accept requests on {} to {}",
-        &device.listen.bind, &device.modbus.url
-    );
-    loop {
-        let (client, _) = listener.accept().await.unwrap();
-        let tx = tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = client_task(client, tx).await {
-                error!("Client error: {:?}", err);
-            }
+            modbus_task(&modbus_url, &mut rx).await;
         });
+        info!(
+            "Ready to accept requests on {} to {}",
+            &self.listen.bind, &self.modbus.url
+        );
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = client_task(client, tx).await {
+                    error!("Client error: {:?}", err);
+                }
+            });
+        }
     }
 }

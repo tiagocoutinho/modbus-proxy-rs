@@ -1,7 +1,6 @@
-use futures::future::join_all;
 use structopt::StructOpt;
 
-use modbus_proxy_rs::{bridge_task, Settings};
+use modbus_proxy_rs::Server;
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -21,17 +20,7 @@ struct CmdLine {
 async fn main() {
     env_logger::init();
     let args = CmdLine::from_args();
-    match Settings::new(&args.config_file) {
-        Ok(mut cfg) => {
-            let tasks = cfg
-                .devices
-                .drain(..)
-                .map(|device| tokio::spawn(bridge_task(device)))
-                .collect::<Vec<_>>();
-            join_all(tasks).await;
-        }
-        Err(error) => {
-            eprintln!("Configuration error: {}", error)
-        }
+    if let Err(error) = Server::launch(&args.config_file).await {
+        eprintln!("Configuration error: {}", error)
     }
 }
