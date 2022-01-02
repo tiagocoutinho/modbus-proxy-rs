@@ -72,61 +72,6 @@ struct Device {
     stream: Option<(TcpReader, TcpWriter)>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Bridge {
-    listen: Listen,
-    modbus: Modbus,
-}
-
-impl Bridge {
-    pub async fn run(&mut self) {
-        let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
-        let modbus_url = self.modbus.url.clone();
-        let (tx, mut rx) = mpsc::channel::<Message>(32);
-        tokio::spawn(async move {
-            Device::launch(&modbus_url, &mut rx).await;
-        });
-        info!(
-            "Ready to accept requests on {} to {}",
-            &self.listen.bind, &self.modbus.url
-        );
-        loop {
-            let (client, _) = listener.accept().await.unwrap();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(err) = client_task(client, tx).await {
-                    error!("Client error: {:?}", err);
-                }
-            });
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Server {
-    bridges: Vec<Bridge>,
-}
-
-impl Server {
-    pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
-        let mut cfg = config::Config::new();
-        cfg.merge(config::File::with_name(config_file)).unwrap();
-        cfg.try_into()
-    }
-
-    pub async fn run(self) {
-        let mut tasks = vec![];
-        for mut bridge in self.bridges {
-            tasks.push(tokio::spawn(async move { bridge.run().await }));
-        }
-        join_all(tasks).await;
-    }
-
-    pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
-        Ok(Self::new(config_file)?.run().await)
-    }
-}
-
 impl Device {
     pub fn new(url: &str) -> Device {
         Device {
@@ -225,16 +170,71 @@ impl Device {
     }
 }
 
-async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
-    client.set_nodelay(true)?;
-    channel.send(Message::Connection).await?;
-    let (mut reader, mut writer) = split_connection(client);
-    while let Ok(buf) = read_frame(&mut reader).await {
-        let (tx, rx) = oneshot::channel();
-        channel.send(Message::Packet(buf, tx)).await?;
-        writer.write_all(&rx.await?).await?;
-        writer.flush().await?;
+#[derive(Debug, Deserialize)]
+struct Bridge {
+    listen: Listen,
+    modbus: Modbus,
+}
+
+impl Bridge {
+    pub async fn run(&mut self) {
+        let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
+        let modbus_url = self.modbus.url.clone();
+        let (tx, mut rx) = mpsc::channel::<Message>(32);
+        tokio::spawn(async move {
+            Device::launch(&modbus_url, &mut rx).await;
+        });
+        info!(
+            "Ready to accept requests on {} to {}",
+            &self.listen.bind, &self.modbus.url
+        );
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = Self::handle_client(client, tx).await {
+                    error!("Client error: {:?}", err);
+                }
+            });
+        }
     }
-    channel.send(Message::Disconnection).await?;
-    Ok(())
+
+    async fn handle_client(client: TcpStream, channel: ChannelTx) -> Result<()> {
+        client.set_nodelay(true)?;
+        channel.send(Message::Connection).await?;
+        let (mut reader, mut writer) = split_connection(client);
+        while let Ok(buf) = read_frame(&mut reader).await {
+            let (tx, rx) = oneshot::channel();
+            channel.send(Message::Packet(buf, tx)).await?;
+            writer.write_all(&rx.await?).await?;
+            writer.flush().await?;
+        }
+        channel.send(Message::Disconnection).await?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Server {
+    bridges: Vec<Bridge>,
+}
+
+impl Server {
+    pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
+        let mut cfg = config::Config::new();
+        cfg.merge(config::File::with_name(config_file)).unwrap();
+        cfg.try_into()
+    }
+
+    pub async fn run(self) {
+        let mut tasks = vec![];
+        for mut bridge in self.bridges {
+            tasks.push(tokio::spawn(async move { bridge.run().await }));
+        }
+        join_all(tasks).await;
+    }
+
+    pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
+        Ok(Self::new(config_file)?.run().await)
+    }
 }
