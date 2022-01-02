@@ -1,6 +1,8 @@
 #[macro_use]
 extern crate log;
 
+use config;
+use serde::Deserialize;
 use structopt::StructOpt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
@@ -10,21 +12,6 @@ use tokio::sync::{mpsc, oneshot};
 #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
-#[derive(Debug, StructOpt)]
-#[structopt(
-    name = "modbus proxy",
-    about = "Connect multiple clients to modbus devices"
-)]
-struct Config {
-    #[structopt(short = "b", long = "bind", help = "listen TCP address (ex: 0:5020)")]
-    bind_address: String,
-    #[structopt(
-        long = "modbus",
-        help = "modbus device TCP address (ex: plc.acme.org:502)"
-    )]
-    modbus_address: String,
-}
 
 type Frame = Vec<u8>;
 type ReplySender = oneshot::Sender<Frame>;
@@ -45,29 +32,55 @@ type Result<T> = std::result::Result<T, Error>;
 type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
 
+#[derive(Debug, Deserialize)]
+struct Listen {
+    bind: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct Modbus {
-    address: String,
+    url: String,
+    #[serde(skip)]
     stream: Option<(TcpReader, TcpWriter)>,
 }
 
+#[derive(Debug, Deserialize)]
+struct Device {
+    listen: Listen,
+    modbus: Modbus,
+}
+
+#[derive(Debug, Deserialize)]
+struct Settings {
+    devices: Vec<Device>,
+}
+
+impl Settings {
+    fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
+        let mut cfg = config::Config::new();
+        cfg.merge(config::File::with_name(config_file)).unwrap();
+        cfg.try_into()
+    }
+}
+
 impl Modbus {
-    fn new(address: &str) -> Modbus {
+    fn new(url: &str) -> Modbus {
         Modbus {
-            address: address.to_string(),
+            url: url.to_string(),
             stream: None,
         }
     }
 
     async fn connect(&mut self) -> Result<()> {
-        match create_connection(&self.address).await {
+        match create_connection(&self.url).await {
             Ok(connection) => {
-                info!("modbus connection to {} sucessfull", self.address);
+                info!("modbus connection to {} sucessfull", self.url);
                 self.stream = Some(connection);
                 Ok(())
             }
             Err(error) => {
                 self.stream = None;
-                info!("modbus connection to {} error: {} ", self.address, error);
+                info!("modbus connection to {} error: {} ", self.url, error);
                 Err(error)
             }
         }
@@ -115,8 +128,8 @@ fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
     (BufReader::new(reader), BufWriter::new(writer))
 }
 
-async fn create_connection(address: &str) -> Result<(TcpReader, TcpWriter)> {
-    let stream = TcpStream::connect(address).await?;
+async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
+    let stream = TcpStream::connect(url).await?;
     stream.set_nodelay(true)?;
     Ok(split_connection(stream))
 }
@@ -147,19 +160,19 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
 }
 
 async fn modbus_packet(modbus: &mut Modbus, frame: Frame, channel: ReplySender) -> Result<()> {
-    info!("modbus request {}: {} bytes", modbus.address, frame.len());
-    debug!("modbus request {}: {:?}", modbus.address, &frame[..]);
+    info!("modbus request {}: {} bytes", modbus.url, frame.len());
+    debug!("modbus request {}: {:?}", modbus.url, &frame[..]);
     let reply = modbus.write_read(&frame).await?;
-    info!("modbus reply {}: {} bytes", modbus.address, reply.len());
-    debug!("modbus reply {}: {:?}", modbus.address, &reply[..]);
+    info!("modbus reply {}: {} bytes", modbus.url, reply.len());
+    debug!("modbus reply {}: {:?}", modbus.url, &reply[..]);
     channel
         .send(reply)
         .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
 }
 
-async fn modbus_task(address: &str, channel: &mut ChannelRx) {
+async fn modbus_task(url: &str, channel: &mut ChannelRx) {
     let mut nb_clients = 0;
-    let mut modbus = Modbus::new(address);
+    let mut modbus = Modbus::new(url);
 
     while let Some(message) = channel.recv().await {
         match message {
@@ -171,7 +184,7 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
                 nb_clients -= 1;
                 info!("client disconnection (active = {})", nb_clients);
                 if nb_clients == 0 {
-                    info!("disconnecting from modbus at {} (no clients)", address);
+                    info!("disconnecting from modbus at {} (no clients)", url);
                     modbus.disconnect();
                 }
             }
@@ -184,17 +197,17 @@ async fn modbus_task(address: &str, channel: &mut ChannelRx) {
     }
 }
 
-async fn bridge_task(config: Config) {
-    let modbus_address = config.modbus_address.clone();
-    let listener = TcpListener::bind(&config.bind_address).await.unwrap();
+async fn bridge_task(device: &Device) {
+    let modbus_url = device.modbus.url.clone();
+    let listener = TcpListener::bind(&device.listen.bind).await.unwrap();
     let (tx, mut rx) = mpsc::channel::<Message>(32);
 
     tokio::spawn(async move {
-        modbus_task(&config.modbus_address, &mut rx).await;
+        modbus_task(&modbus_url, &mut rx).await;
     });
     info!(
         "Ready to accept requests on {} to {}",
-        &config.bind_address, &modbus_address
+        &device.listen.bind, &device.modbus.url
     );
     loop {
         let (client, _) = listener.accept().await.unwrap();
@@ -207,9 +220,24 @@ async fn bridge_task(config: Config) {
     }
 }
 
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "modbus proxy",
+    about = "Connect multiple clients to modbus devices"
+)]
+struct CmdLine {
+    #[structopt(
+        short = "c",
+        long = "config-file",
+        help = "configuration file (accepts YAML, TOML, JSON)"
+    )]
+    config_file: String,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     env_logger::init();
-    let config = Config::from_args();
-    bridge_task(config).await
+    let args = CmdLine::from_args();
+    let settings = Settings::new(&args.config_file).unwrap();
+    bridge_task(&settings.devices[0]).await
 }
