@@ -216,7 +216,7 @@ impl Bridge {
 
 #[derive(Debug, Deserialize)]
 pub struct Server {
-    bridges: Vec<Bridge>,
+    devices: Vec<Bridge>,
 }
 
 impl Server {
@@ -228,7 +228,7 @@ impl Server {
 
     pub async fn run(self) {
         let mut tasks = vec![];
-        for mut bridge in self.bridges {
+        for mut bridge in self.devices {
             tasks.push(tokio::spawn(async move { bridge.run().await }));
         }
         join_all(tasks).await;
