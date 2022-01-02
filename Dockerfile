@@ -38,12 +38,11 @@ RUN rm ./target/x86_64-unknown-linux-musl/release/deps/modbus_proxy_rs*
 RUN cargo build --target x86_64-unknown-linux-musl --release
 
 # 8. Strip debug symbols to reduce binary size
-RUN strip -s /modbus-proxy-rs/target/x86_64-unknown-linux-musl/release/modbus-proxy-rs
+RUN strip -s ./target/x86_64-unknown-linux-musl/release/modbus-proxy-rs
 
 # our final base
 FROM scratch
 
-# Import user definition from builder.
 COPY --from=build /etc/passwd /etc/passwd
 COPY --from=build /etc/group /etc/group
 
@@ -55,3 +54,4 @@ COPY --from=build /modbus-proxy-rs/target/x86_64-unknown-linux-musl/release/modb
 
 # Set the startup command to run
 ENTRYPOINT ["./modbus-proxy-rs"]
+CMD ["-c", "/etc/modbus-proxy.yml"]
