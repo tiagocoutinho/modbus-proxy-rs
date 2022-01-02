@@ -1,6 +1,6 @@
 [package]
 name = "modbus-proxy-rs"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2021"
 authors = [ "Tiago Coutinho <coutinhotiago@gmail.com>",]
 description = "Modbus TCP proxy"
