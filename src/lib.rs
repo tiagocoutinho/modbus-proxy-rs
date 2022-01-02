@@ -222,7 +222,7 @@ pub struct Server {
 impl Server {
     pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
         let mut cfg = config::Config::new();
-        cfg.merge(config::File::with_name(config_file)).unwrap();
+        cfg.merge(config::File::with_name(config_file))?;
         cfg.try_into()
     }
 
