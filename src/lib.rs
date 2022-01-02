@@ -31,27 +31,80 @@ type Result<T> = std::result::Result<T, Error>;
 type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
 type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
 
-#[derive(Debug, Deserialize)]
-pub struct Listen {
-    pub bind: String,
+fn frame_size(frame: &[u8]) -> Result<usize> {
+    Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
+}
+
+fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
+    let (reader, writer) = stream.into_split();
+    (BufReader::new(reader), BufWriter::new(writer))
+}
+
+async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
+    let stream = TcpStream::connect(url).await?;
+    stream.set_nodelay(true)?;
+    Ok(split_connection(stream))
+}
+
+async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
+    let mut buf = vec![0u8; 6];
+    // Read header
+    stream.read_exact(&mut buf).await?;
+    // calculate payload size
+    let total_size = 6 + frame_size(&buf)?;
+    buf.resize(total_size, 0);
+    stream.read_exact(&mut buf[6..total_size]).await?;
+    Ok(buf)
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Device {
+struct Listen {
+    bind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Modbus {
     url: String,
-    #[serde(skip)]
+}
+
+struct Device {
+    url: String,
     stream: Option<(TcpReader, TcpWriter)>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Bridge {
-    pub listen: Listen,
-    pub modbus: Device,
+struct Bridge {
+    listen: Listen,
+    modbus: Modbus,
+}
+
+impl Bridge {
+    pub async fn run(&mut self) {
+        let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
+        let modbus_url = self.modbus.url.clone();
+        let (tx, mut rx) = mpsc::channel::<Message>(32);
+        tokio::spawn(async move {
+            Device::launch(&modbus_url, &mut rx).await;
+        });
+        info!(
+            "Ready to accept requests on {} to {}",
+            &self.listen.bind, &self.modbus.url
+        );
+        loop {
+            let (client, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = client_task(client, tx).await {
+                    error!("Client error: {:?}", err);
+                }
+            });
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Server {
-    pub bridges: Vec<Bridge>,
+    bridges: Vec<Bridge>,
 }
 
 impl Server {
@@ -61,12 +114,11 @@ impl Server {
         cfg.try_into()
     }
 
-    pub async fn run(&mut self) {
-        let tasks = self
-            .bridges
-            .drain(..)
-            .map(|bridge| tokio::spawn(bridge.run()))
-            .collect::<Vec<_>>();
+    pub async fn run(self) {
+        let mut tasks = vec![];
+        for mut bridge in self.bridges {
+            tasks.push(tokio::spawn(async move { bridge.run().await }));
+        }
         join_all(tasks).await;
     }
 
@@ -129,32 +181,48 @@ impl Device {
             self.raw_write_read(&frame).await
         }
     }
-}
 
-fn frame_size(frame: &[u8]) -> Result<usize> {
-    Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
-}
+    async fn handle_packet(&mut self, frame: Frame, channel: ReplySender) -> Result<()> {
+        info!("modbus request {}: {} bytes", self.url, frame.len());
+        debug!("modbus request {}: {:?}", self.url, &frame[..]);
+        let reply = self.write_read(&frame).await?;
+        info!("modbus reply {}: {} bytes", self.url, reply.len());
+        debug!("modbus reply {}: {:?}", self.url, &reply[..]);
+        channel
+            .send(reply)
+            .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
+    }
 
-fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
-    let (reader, writer) = stream.into_split();
-    (BufReader::new(reader), BufWriter::new(writer))
-}
+    async fn run(&mut self, channel: &mut ChannelRx) {
+        let mut nb_clients = 0;
 
-async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
-    let stream = TcpStream::connect(url).await?;
-    stream.set_nodelay(true)?;
-    Ok(split_connection(stream))
-}
+        while let Some(message) = channel.recv().await {
+            match message {
+                Message::Connection => {
+                    nb_clients += 1;
+                    info!("new client connection (active = {})", nb_clients);
+                }
+                Message::Disconnection => {
+                    nb_clients -= 1;
+                    info!("client disconnection (active = {})", nb_clients);
+                    if nb_clients == 0 {
+                        info!("disconnecting from modbus at {} (no clients)", self.url);
+                        self.disconnect();
+                    }
+                }
+                Message::Packet(frame, channel) => {
+                    if let Err(_) = self.handle_packet(frame, channel).await {
+                        self.disconnect();
+                    }
+                }
+            }
+        }
+    }
 
-async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
-    let mut buf = vec![0u8; 6];
-    // Read header
-    stream.read_exact(&mut buf).await?;
-    // calculate payload size
-    let total_size = 6 + frame_size(&buf)?;
-    buf.resize(total_size, 0);
-    stream.read_exact(&mut buf[6..total_size]).await?;
-    Ok(buf)
+    async fn launch(url: &str, channel: &mut ChannelRx) {
+        let mut modbus = Self::new(url);
+        modbus.run(channel).await;
+    }
 }
 
 async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
@@ -169,67 +237,4 @@ async fn client_task(client: TcpStream, channel: ChannelTx) -> Result<()> {
     }
     channel.send(Message::Disconnection).await?;
     Ok(())
-}
-
-async fn modbus_packet(device: &mut Device, frame: Frame, channel: ReplySender) -> Result<()> {
-    info!("modbus request {}: {} bytes", device.url, frame.len());
-    debug!("modbus request {}: {:?}", device.url, &frame[..]);
-    let reply = device.write_read(&frame).await?;
-    info!("modbus reply {}: {} bytes", device.url, reply.len());
-    debug!("modbus reply {}: {:?}", device.url, &reply[..]);
-    channel
-        .send(reply)
-        .or_else(|error| Err(format!("error sending reply to client: {:?}", error).into()))
-}
-
-async fn modbus_task(url: &str, channel: &mut ChannelRx) {
-    let mut nb_clients = 0;
-    let mut device = Device::new(url);
-
-    while let Some(message) = channel.recv().await {
-        match message {
-            Message::Connection => {
-                nb_clients += 1;
-                info!("new client connection (active = {})", nb_clients);
-            }
-            Message::Disconnection => {
-                nb_clients -= 1;
-                info!("client disconnection (active = {})", nb_clients);
-                if nb_clients == 0 {
-                    info!("disconnecting from modbus at {} (no clients)", url);
-                    device.disconnect();
-                }
-            }
-            Message::Packet(frame, channel) => {
-                if let Err(_) = modbus_packet(&mut device, frame, channel).await {
-                    device.disconnect();
-                }
-            }
-        }
-    }
-}
-
-impl Bridge {
-    pub async fn run(self) {
-        let modbus_url = self.modbus.url.clone();
-        let listener = TcpListener::bind(&self.listen.bind).await.unwrap();
-        let (tx, mut rx) = mpsc::channel::<Message>(32);
-
-        tokio::spawn(async move {
-            modbus_task(&modbus_url, &mut rx).await;
-        });
-        info!(
-            "Ready to accept requests on {} to {}",
-            &self.listen.bind, &self.modbus.url
-        );
-        loop {
-            let (client, _) = listener.accept().await.unwrap();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(err) = client_task(client, tx).await {
-                    error!("Client error: {:?}", err);
-                }
-            });
-        }
-    }
 }
