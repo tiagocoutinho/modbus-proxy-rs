@@ -1,7 +1,8 @@
 #[macro_use]
 extern crate log;
 
-use config;
+use config::{Config, ConfigError};
+use futures::future::join_all;
 use serde::Deserialize;
 use structopt::StructOpt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -56,8 +57,8 @@ struct Settings {
 }
 
 impl Settings {
-    fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
-        let mut cfg = config::Config::new();
+    fn new(config_file: &str) -> std::result::Result<Self, ConfigError> {
+        let mut cfg = Config::new();
         cfg.merge(config::File::with_name(config_file)).unwrap();
         cfg.try_into()
     }
@@ -197,7 +198,7 @@ async fn modbus_task(url: &str, channel: &mut ChannelRx) {
     }
 }
 
-async fn bridge_task(device: &Device) {
+async fn bridge_task(device: Device) {
     let modbus_url = device.modbus.url.clone();
     let listener = TcpListener::bind(&device.listen.bind).await.unwrap();
     let (tx, mut rx) = mpsc::channel::<Message>(32);
@@ -238,6 +239,17 @@ struct CmdLine {
 async fn main() {
     env_logger::init();
     let args = CmdLine::from_args();
-    let settings = Settings::new(&args.config_file).unwrap();
-    bridge_task(&settings.devices[0]).await
+    match Settings::new(&args.config_file) {
+        Ok(mut cfg) => {
+            let tasks = cfg
+                .devices
+                .drain(..)
+                .map(|device| tokio::spawn(bridge_task(device)))
+                .collect::<Vec<_>>();
+            join_all(tasks).await;
+        }
+        Err(error) => {
+            eprintln!("Configuration error: {}", error)
+        }
+    }
 }
