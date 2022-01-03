@@ -3,7 +3,7 @@ extern crate log;
 
 use futures::future::join_all;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,25 +28,11 @@ type ChannelTx = mpsc::Sender<Message>;
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, Error>;
 
-type TcpReader = BufReader<tokio::net::tcp::OwnedReadHalf>;
-type TcpWriter = BufWriter<tokio::net::tcp::OwnedWriteHalf>;
-
 fn frame_size(frame: &[u8]) -> Result<usize> {
     Ok(u16::from_be_bytes(frame[4..6].try_into()?) as usize)
 }
 
-fn split_connection(stream: TcpStream) -> (TcpReader, TcpWriter) {
-    let (reader, writer) = stream.into_split();
-    (BufReader::new(reader), BufWriter::new(writer))
-}
-
-async fn create_connection(url: &str) -> Result<(TcpReader, TcpWriter)> {
-    let stream = TcpStream::connect(url).await?;
-    stream.set_nodelay(true)?;
-    Ok(split_connection(stream))
-}
-
-async fn read_frame(stream: &mut TcpReader) -> Result<Frame> {
+async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Frame> {
     let mut buf = vec![0u8; 6];
     // Read header
     stream.read_exact(&mut buf).await?;
@@ -69,7 +55,7 @@ struct Modbus {
 
 struct Device {
     url: String,
-    stream: Option<(TcpReader, TcpWriter)>,
+    stream: Option<TcpStream>,
 }
 
 impl Device {
@@ -81,16 +67,17 @@ impl Device {
     }
 
     async fn connect(&mut self) -> Result<()> {
-        match create_connection(&self.url).await {
-            Ok(connection) => {
+        match TcpStream::connect(&self.url).await {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
                 info!("modbus connection to {} sucessfull", self.url);
-                self.stream = Some(connection);
+                self.stream = Some(stream);
                 Ok(())
             }
             Err(error) => {
                 self.stream = None;
                 info!("modbus connection to {} error: {} ", self.url, error);
-                Err(error)
+                Err(Box::new(error))
             }
         }
     }
@@ -104,10 +91,10 @@ impl Device {
     }
 
     async fn raw_write_read(&mut self, frame: &Frame) -> Result<Frame> {
-        let (reader, writer) = self.stream.as_mut().ok_or("no modbus connection")?;
-        writer.write_all(&frame).await?;
-        writer.flush().await?;
-        read_frame(reader).await
+        let stream = self.stream.as_mut().ok_or("no modbus connection")?;
+        stream.write_all(&frame).await?;
+        stream.flush().await?;
+        read_frame(stream).await
     }
 
     async fn write_read(&mut self, frame: &Frame) -> Result<Frame> {
@@ -189,25 +176,27 @@ impl Bridge {
             &self.listen.bind, &self.modbus.url
         );
         loop {
-            let (client, _) = listener.accept().await.unwrap();
+            let (mut client, _) = listener.accept().await.unwrap();
+            client.set_nodelay(true).unwrap();
             let tx = tx.clone();
             tokio::spawn(async move {
-                if let Err(err) = Self::handle_client(client, tx).await {
+                if let Err(err) = Self::handle_client(&mut client, tx).await {
                     error!("Client error: {:?}", err);
                 }
             });
         }
     }
 
-    async fn handle_client(client: TcpStream, channel: ChannelTx) -> Result<()> {
-        client.set_nodelay(true)?;
+    async fn handle_client(
+        client: &mut (impl AsyncRead + AsyncWrite + Unpin),
+        channel: ChannelTx,
+    ) -> Result<()> {
         channel.send(Message::Connection).await?;
-        let (mut reader, mut writer) = split_connection(client);
-        while let Ok(buf) = read_frame(&mut reader).await {
+        while let Ok(buf) = read_frame(client).await {
             let (tx, rx) = oneshot::channel();
             channel.send(Message::Packet(buf, tx)).await?;
-            writer.write_all(&rx.await?).await?;
-            writer.flush().await?;
+            client.write_all(&rx.await?).await?;
+            client.flush().await?;
         }
         channel.send(Message::Disconnection).await?;
         Ok(())
@@ -237,4 +226,25 @@ impl Server {
     pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
         Ok(Self::new(config_file)?.run().await)
     }
+}
+
+#[test]
+fn test_device_not_connected() {
+    let device = Device::new("some url");
+    assert_eq!(device.url, "some url");
+    assert!(device.stream.is_none());
+    assert_eq!(device.is_connected(), false);
+}
+
+#[test]
+fn test_device_not_connected_disconnects() {
+    let mut device = Device::new("some url");
+    assert_eq!(device.is_connected(), false);
+    device.disconnect();
+    assert_eq!(device.is_connected(), false);
+}
+
+#[tokio::test]
+async fn test_device_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 }
