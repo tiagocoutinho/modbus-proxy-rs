@@ -8,9 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 // Use Jemalloc only for musl-64 bits platforms
-#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+//#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+//#[global_allocator]
+//static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 type Frame = Vec<u8>;
 type ReplySender = oneshot::Sender<Frame>;
@@ -221,9 +221,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
-        let mut cfg = config::Config::new();
-        cfg.merge(config::File::with_name(config_file))?;
-        cfg.try_into()
+        let settings = config::Config::builder()
+            .add_source(config::File::with_name(config_file))
+            .build()?;
+        settings.try_deserialize()
     }
 
     pub async fn run(self) {
