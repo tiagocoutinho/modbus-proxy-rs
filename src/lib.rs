@@ -202,6 +202,15 @@ impl Bridge {
     async fn handle_client(client: TcpStream, channel: ChannelTx) -> Result<()> {
         client.set_nodelay(true)?;
         channel.send(Message::Connection).await?;
+
+        let result = Self::client_loop(client, &channel).await;
+
+        channel.send(Message::Disconnection).await?;
+
+        result
+    }
+
+    async fn client_loop(client: TcpStream, channel: &ChannelTx) -> Result<()> {
         let (mut reader, mut writer) = split_connection(client);
         while let Ok(buf) = read_frame(&mut reader).await {
             let (tx, rx) = oneshot::channel();
@@ -209,7 +218,6 @@ impl Bridge {
             writer.write_all(&rx.await?).await?;
             writer.flush().await?;
         }
-        channel.send(Message::Disconnection).await?;
         Ok(())
     }
 }
