@@ -8,9 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
 // Use Jemalloc only for musl-64 bits platforms
-#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+//#[cfg(all(target_env = "musl", target_pointer_width = "64"))]
+//#[global_allocator]
+//static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 type Frame = Vec<u8>;
 type ReplySender = oneshot::Sender<Frame>;
@@ -202,6 +202,15 @@ impl Bridge {
     async fn handle_client(client: TcpStream, channel: ChannelTx) -> Result<()> {
         client.set_nodelay(true)?;
         channel.send(Message::Connection).await?;
+
+        let result = Self::client_loop(client, &channel).await;
+
+        channel.send(Message::Disconnection).await?;
+
+        result
+    }
+
+    async fn client_loop(client: TcpStream, channel: &ChannelTx) -> Result<()> {
         let (mut reader, mut writer) = split_connection(client);
         while let Ok(buf) = read_frame(&mut reader).await {
             let (tx, rx) = oneshot::channel();
@@ -209,7 +218,6 @@ impl Bridge {
             writer.write_all(&rx.await?).await?;
             writer.flush().await?;
         }
-        channel.send(Message::Disconnection).await?;
         Ok(())
     }
 }
@@ -221,9 +229,10 @@ pub struct Server {
 
 impl Server {
     pub fn new(config_file: &str) -> std::result::Result<Self, config::ConfigError> {
-        let mut cfg = config::Config::new();
-        cfg.merge(config::File::with_name(config_file))?;
-        cfg.try_into()
+        let settings = config::Config::builder()
+            .add_source(config::File::with_name(config_file))
+            .build()?;
+        settings.try_deserialize()
     }
 
     pub async fn run(self) {

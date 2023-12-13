@@ -1,8 +1,11 @@
-FROM rust:1.57 as build
+FROM rust:1.74-slim-bookworm as build
 
 # 1. Prepare to build using musl
+ENV RUSTFLAGS='-C linker=x86_64-linux-gnu-gcc'
+ENV CC_x86_64_unknown_linux_musl=clang
+ENV AR_x86_64_unknown_linux_musl=llvm-ar
 RUN rustup target add x86_64-unknown-linux-musl
-RUN apt update && apt install -y musl-tools musl-dev
+RUN apt update && apt install -y musl-dev gcc-x86-64-linux-gnu clang llvm
 RUN update-ca-certificates
 
 # 2. setup app user
@@ -38,7 +41,7 @@ RUN rm ./target/x86_64-unknown-linux-musl/release/deps/modbus_proxy_rs*
 RUN cargo build --target x86_64-unknown-linux-musl --release
 
 # 8. Strip debug symbols to reduce binary size
-RUN strip -s ./target/x86_64-unknown-linux-musl/release/modbus-proxy-rs
+RUN x86_64-linux-gnu-strip -s ./target/x86_64-unknown-linux-musl/release/modbus-proxy-rs
 
 # our final base
 FROM scratch

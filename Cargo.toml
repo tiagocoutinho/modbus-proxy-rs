@@ -7,7 +7,7 @@ description = "Modbus TCP proxy"
 homepage = "https://github.com/tiagocoutinho/modbus-proxy-rs"
 repository = "https://github.com/tiagocoutinho/modbus-proxy-rs"
 readme = "README.md"
-rust-version = "1.56"
+rust-version = "1.74"
 keywords = [ "modbus", "TCP", "proxy", "bridge" ]
 categories = ["network-programming"]
 license = "GPL-3.0-or-later"
@@ -17,16 +17,16 @@ publish = true
 maintenance = { status = "experimental" }
 
 [dependencies]
-tokio = { version = "1.15", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1.34", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
 structopt = "0.3"
 log = "0.4"
-env_logger = "0.9"
-config = "0.11"
+env_logger = "0.10"
+config = "0.13"
 serde = { version = "1", features = ["derive"] }
-futures = "0.3.19"
+futures = "0.3.29"
 
-[target.'cfg(all(target_env = "musl", target_pointer_width = "64"))'.dependencies.jemallocator]
-version = "0.3"
+#[target.'cfg(all(target_env = "musl", target_pointer_width = "64"))'.dependencies.jemallocator]
+#version = "0.5"
 
 [profile.release]
 opt-level = "z"
