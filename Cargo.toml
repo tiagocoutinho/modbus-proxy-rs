@@ -17,16 +17,16 @@ publish = true
 maintenance = { status = "experimental" }
 
 [dependencies]
-tokio = { version = "1.15", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
+tokio = { version = "1.36", features = ["rt", "net", "macros", "io-util", "sync", "time"] }
 structopt = "0.3"
 log = "0.4"
-env_logger = "0.9"
+env_logger = "0.11"
 config = "0.11"
 serde = { version = "1", features = ["derive"] }
-futures = "0.3.19"
+futures = "0.3"
 
 [target.'cfg(all(target_env = "musl", target_pointer_width = "64"))'.dependencies.jemallocator]
-version = "0.3"
+version = "0.5"
 
 [profile.release]
 opt-level = "z"
