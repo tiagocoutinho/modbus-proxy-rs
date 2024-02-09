@@ -95,6 +95,24 @@ impl Device {
         }
     }
 
+    async fn connect_retry(&mut self) -> Result<()> {
+        for retry in 0..=5 {
+            match self.connect().await {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    if retry == 5 {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "could not connect to Modbus device"
+        )))
+    }
+
     fn disconnect(&mut self) {
         self.stream = None;
     }
@@ -111,20 +129,26 @@ impl Device {
     }
 
     async fn write_read(&mut self, frame: &Frame) -> Result<Frame> {
-        if self.is_connected() {
+        if !self.is_connected() {
+            self.connect_retry().await?;
+        }
+
+        for i in 0..=5 {
             let result = self.raw_write_read(&frame).await;
             match result {
-                Ok(reply) => Ok(reply),
+                Ok(reply) => return Ok(reply),
                 Err(error) => {
                     warn!("modbus error: {}. Retrying...", error);
-                    self.connect().await?;
-                    self.raw_write_read(&frame).await
+                    if i == 5 {
+                        return Err(error);
+                    }
                 }
             }
-        } else {
-            self.connect().await?;
-            self.raw_write_read(&frame).await
         }
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Failed to read-write"
+        )))
     }
 
     async fn handle_packet(&mut self, frame: Frame, channel: ReplySender) -> Result<()> {
@@ -144,6 +168,12 @@ impl Device {
         while let Some(message) = channel.recv().await {
             match message {
                 Message::Connection => {
+                    if !self.is_connected() {
+                        if let Err(_) = self.connect().await {
+                            error!("error connecting to modbus device");
+                        }
+                    }
+
                     nb_clients += 1;
                     info!("new client connection (active = {})", nb_clients);
                 }
