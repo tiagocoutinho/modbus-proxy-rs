@@ -5,6 +5,8 @@ use futures::future::join_all;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot};
 
 // Use Jemalloc only for musl-64 bits platforms
@@ -240,7 +242,17 @@ impl Server {
         for mut bridge in self.devices {
             tasks.push(tokio::spawn(async move { bridge.run().await }));
         }
-        join_all(tasks).await;
+
+        #[cfg(unix)]
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = join_all(tasks) => debug!("All tasks finished"),
+            _ = tokio::signal::ctrl_c() => debug!("Received Ctrl+C"),
+            //#[cfg(unix)]
+            _ = sigterm.recv() => debug!("Received SIGTERM"),
+        }
+
+        info!("Shutting down");
     }
 
     pub async fn launch(config_file: &str) -> std::result::Result<(), config::ConfigError> {
